@@ -1,4 +1,12 @@
-import { useState, type FormEvent } from 'react'
+import {
+  useEffect,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+} from 'react'
+import type { Session } from '@supabase/supabase-js'
+import AuthPanel from './components/AuthPanel'
+import { supabase } from './lib/supabase'
 import {
   ArrowRight,
   Camera,
@@ -18,7 +26,60 @@ function App() {
   const [complaintId, setComplaintId] = useState('')
   const [trackingResult, setTrackingResult] = useState<boolean | null>(null)
   const [submitted, setSubmitted] = useState(false)
+  const [session, setSession] = useState<Session | null>(null)
 
+  const [reportTitle, setReportTitle] = useState('')
+  const [reportDescription, setReportDescription] = useState('')
+  const [reportLocation, setReportLocation] = useState('')
+
+  const [submitting, setSubmitting] = useState(false)
+  const [submissionError, setSubmissionError] = useState('')
+  const [submittedCode, setSubmittedCode] = useState('')
+
+  const [photo, setPhoto] = useState<File | null>(null)
+  const [photoPreview, setPhotoPreview] = useState('')
+
+  const [coordinates, setCoordinates] = useState<{
+    latitude: number
+    longitude: number
+  } | null>(null)
+
+  const [gettingLocation, setGettingLocation] = useState(false)
+  const [locationError, setLocationError] = useState('')
+
+  // Authentication session
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session)
+    })
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session)
+    })
+
+    return () => {
+      subscription.unsubscribe()
+    }
+  }, [])
+
+  // Generate and clean up the photo preview URL
+  useEffect(() => {
+    if (!photo) {
+      setPhotoPreview('')
+      return
+    }
+
+    const previewUrl = URL.createObjectURL(photo)
+    setPhotoPreview(previewUrl)
+
+    return () => {
+      URL.revokeObjectURL(previewUrl)
+    }
+  }, [photo])
+
+  // Demo complaint tracking
   function handleTracking(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
 
@@ -27,9 +88,230 @@ function App() {
     setTrackingResult(id === 'CLN-2026-001')
   }
 
-  function handleReport(event: FormEvent<HTMLFormElement>) {
+  // Handle photo selection or camera capture
+  function handlePhotoChange(event: ChangeEvent<HTMLInputElement>) {
+    const selectedFile = event.target.files?.[0]
+
+    if (!selectedFile) return
+
+    setSubmissionError('')
+
+    if (!selectedFile.type.startsWith('image/')) {
+      setSubmissionError('Please select an image file.')
+      event.target.value = ''
+      return
+    }
+
+    const maxFileSize = 2 * 1024 * 1024
+
+    if (selectedFile.size > maxFileSize) {
+      setSubmissionError('The photo must be 2 MB or smaller.')
+      event.target.value = ''
+      return
+    }
+
+    setPhoto(selectedFile)
+  }
+
+  // Obtain GPS coordinates from the browser
+  function handleGetLocation() {
+    setLocationError('')
+    setSubmissionError('')
+
+    if (!navigator.geolocation) {
+      setLocationError(
+        'Geolocation is not supported by this browser.',
+      )
+      return
+    }
+
+    setGettingLocation(true)
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        setCoordinates({
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        })
+
+        setGettingLocation(false)
+      },
+      (error) => {
+        setGettingLocation(false)
+
+        switch (error.code) {
+          case error.PERMISSION_DENIED:
+            setLocationError(
+              'Location permission was denied. Please allow location access and try again.',
+            )
+            break
+
+          case error.POSITION_UNAVAILABLE:
+            setLocationError(
+              'Your current location could not be determined.',
+            )
+            break
+
+          case error.TIMEOUT:
+            setLocationError(
+              'Location request timed out. Please try again.',
+            )
+            break
+
+          default:
+            setLocationError(
+              'Unable to obtain your location.',
+            )
+        }
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 15000,
+        maximumAge: 0,
+      },
+    )
+  }
+
+  // Submit a real complaint
+  async function handleReport(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    setSubmitted(true)
+
+    setSubmissionError('')
+
+    if (!session) {
+      setSubmissionError(
+        'Please sign in using the navigation bar before submitting a complaint.',
+      )
+      return
+    }
+
+    const title = reportTitle.trim()
+    const description = reportDescription.trim()
+    const location = reportLocation.trim()
+
+    if (title.length < 3 || title.length > 120) {
+      setSubmissionError(
+        'The title must be between 3 and 120 characters.',
+      )
+      return
+    }
+
+    if (description.length < 10 || description.length > 2000) {
+      setSubmissionError(
+        'The description must be between 10 and 2000 characters.',
+      )
+      return
+    }
+
+    if (!location) {
+      setSubmissionError('Please enter the reported location.')
+      return
+    }
+
+    if (!photo) {
+      setSubmissionError('Please attach a photo of the issue.')
+      return
+    }
+
+    if (!coordinates) {
+      setSubmissionError(
+        'Please obtain your GPS location before submitting.',
+      )
+      return
+    }
+
+    if (photo.size > 2 * 1024 * 1024) {
+      setSubmissionError('The photo must be 2 MB or smaller.')
+      return
+    }
+
+    setSubmitting(true)
+
+    let uploadedPhotoPath = ''
+
+    try {
+      const fileExtension =
+        photo.type === 'image/png'
+          ? 'png'
+          : photo.type === 'image/webp'
+            ? 'webp'
+            : 'jpg'
+
+      const fileName = `${crypto.randomUUID()}.${fileExtension}`
+      const photoPath = `${session.user.id}/${fileName}`
+
+      // Upload photo to Supabase Storage
+      const { error: uploadError } = await supabase.storage
+        .from('complaint-photos')
+        .upload(photoPath, photo, {
+          contentType: photo.type,
+          upsert: false,
+        })
+
+      if (uploadError) {
+        throw uploadError
+      }
+
+      uploadedPhotoPath = photoPath
+
+      // Insert complaint record into the database
+      const { data, error: insertError } = await supabase
+        .from('complaints')
+        .insert({
+          user_id: session.user.id,
+          title,
+          description,
+          location_text: location,
+          latitude: coordinates.latitude,
+          longitude: coordinates.longitude,
+          photo_path: uploadedPhotoPath,
+        })
+        .select('complaint_code')
+        .single()
+
+      if (insertError) {
+        throw insertError
+      }
+
+      // Display the generated complaint code
+      setSubmittedCode(data.complaint_code)
+      setSubmitted(true)
+
+      // Reset the form
+      setReportTitle('')
+      setReportDescription('')
+      setReportLocation('')
+      setPhoto(null)
+      setCoordinates(null)
+      setLocationError('')
+    } catch (error) {
+      console.error('Complaint submission failed:', error)
+
+      // Remove uploaded photo if database insertion failed
+      if (uploadedPhotoPath) {
+        const { error: cleanupError } = await supabase.storage
+          .from('complaint-photos')
+          .remove([uploadedPhotoPath])
+
+        if (cleanupError) {
+          console.error(
+            'Failed to remove orphaned photo:',
+            cleanupError,
+          )
+        }
+      }
+
+      const message =
+        typeof error === 'object' &&
+        error !== null &&
+        'message' in error
+          ? String(error.message)
+          : 'An unknown error occurred.'
+
+      setSubmissionError(message)
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   return (
@@ -74,6 +356,8 @@ function App() {
           >
             Track complaint
           </a>
+
+          <AuthPanel session={session} />
         </nav>
       </header>
 
@@ -367,7 +651,7 @@ function App() {
           </div>
         </section>
 
-        {/* Complaint tracking */}
+        {/* Complaint tracking - still demonstration data */}
         <section className="track-section section-container" id="track">
           <div className="track-card">
             <div className="track-content">
@@ -458,15 +742,27 @@ function App() {
                   <CheckCircle2 size={34} />
                 </div>
 
-                <h3>Thanks for taking action!</h3>
+                <h3>Complaint submitted successfully!</h3>
+
                 <p>
-                  Your demonstration report has been submitted
-                  successfully.
+                  Your complaint has been saved. Keep this complaint
+                  code to track its progress.
                 </p>
+
+                <div className="tracking-result result-success">
+                  <CheckCircle2 size={19} />
+                  <div>
+                    <strong>Your complaint code</strong>
+                    <span>{submittedCode}</span>
+                  </div>
+                </div>
 
                 <button
                   className="button button-secondary"
-                  onClick={() => setSubmitted(false)}
+                  onClick={() => {
+                    setSubmitted(false)
+                    setSubmissionError('')
+                  }}
                 >
                   Submit another report
                 </button>
@@ -474,17 +770,50 @@ function App() {
             ) : (
               <>
                 <div className="demo-banner">
-                  <span>DEMO</span>
-                  This form is a frontend prototype. Reports are not
-                  saved yet.
+                  <span>LIVE</span>
+                  Complaints are saved to the database.
                 </div>
 
+                {!session && (
+                  <div className="tracking-result result-error">
+                    <ShieldCheck size={19} />
+                    <div>
+                      <strong>Sign in required</strong>
+                      <span>
+                        Please sign in using the navigation bar before
+                        submitting a complaint.
+                      </span>
+                    </div>
+                  </div>
+                )}
+
                 <form className="report-form" onSubmit={handleReport}>
+                  <label>
+                    Complaint title
+                    <input
+                      type="text"
+                      placeholder="e.g. Garbage dumped beside the road"
+                      value={reportTitle}
+                      onChange={(event) =>
+                        setReportTitle(event.target.value)
+                      }
+                      minLength={3}
+                      maxLength={120}
+                      required
+                    />
+                  </label>
+
                   <label>
                     Description
                     <textarea
                       placeholder="Describe the garbage or sanitation issue..."
                       rows={4}
+                      value={reportDescription}
+                      onChange={(event) =>
+                        setReportDescription(event.target.value)
+                      }
+                      minLength={10}
+                      maxLength={2000}
                       required
                     />
                   </label>
@@ -495,28 +824,107 @@ function App() {
                       <MapPin size={18} />
                       <input
                         type="text"
-                        placeholder="Enter the reported location"
+                        placeholder="e.g. Near the bus stop, Main Road"
+                        value={reportLocation}
+                        onChange={(event) =>
+                          setReportLocation(event.target.value)
+                        }
                         required
                       />
                     </div>
                   </label>
 
+                  {/* GPS location */}
+                  <div className="location-capture">
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      onClick={handleGetLocation}
+                      disabled={gettingLocation}
+                    >
+                      <MapPin size={18} />
+                      {gettingLocation
+                        ? 'Getting location...'
+                        : coordinates
+                          ? 'Refresh GPS location'
+                          : 'Attach GPS location'}
+                    </button>
+
+                    {coordinates && (
+                      <p className="location-coordinates">
+                        GPS attached:
+                        <br />
+                        Latitude: {coordinates.latitude.toFixed(6)}
+                        <br />
+                        Longitude: {coordinates.longitude.toFixed(6)}
+                      </p>
+                    )}
+
+                    {locationError && (
+                      <p className="form-error">{locationError}</p>
+                    )}
+                  </div>
+
+                  {/* Photo selection / camera */}
                   <label>
                     Photo
                     <div className="photo-upload">
                       <Camera size={24} />
-                      <span>Choose a photo of the issue</span>
+                      <span>
+                        {photo
+                          ? photo.name
+                          : 'Take a photo or choose an image'}
+                      </span>
+
                       <input
+                        key={photo ? 'photo-selected' : 'no-photo'}
                         type="file"
-                        accept="image/*"
-                        aria-label="Choose a complaint photo"
+                        accept="image/jpeg,image/png,image/webp"
+                        capture="environment"
+                        aria-label="Take or choose a complaint photo"
+                        onChange={handlePhotoChange}
                       />
                     </div>
                   </label>
 
-                  <button type="submit" className="button button-primary">
-                    Submit demonstration report
-                    <ArrowRight size={18} />
+                  {/* Photo preview */}
+                  {photoPreview && (
+                    <div className="photo-preview">
+                      <img
+                        src={photoPreview}
+                        alt="Preview of the complaint"
+                      />
+
+                      <button
+                        type="button"
+                        className="button button-secondary"
+                        onClick={() => setPhoto(null)}
+                      >
+                        Remove photo
+                      </button>
+                    </div>
+                  )}
+
+                  {submissionError && (
+                    <div className="tracking-result result-error">
+                      <X size={19} />
+                      <div>
+                        <strong>Submission failed</strong>
+                        <span>{submissionError}</span>
+                      </div>
+                    </div>
+                  )}
+
+                  <button
+                    type="submit"
+                    className="button button-primary"
+                    disabled={submitting}
+                  >
+                    {submitting
+                      ? 'Submitting complaint...'
+                      : 'Submit complaint'}
+
+                    {!submitting && <ArrowRight size={18} />}
                   </button>
                 </form>
               </>
